@@ -11,8 +11,11 @@ Environment setup
 2) Fill required variables for your accounts/apps:
    - IG_ACCESS_TOKEN
    - IG_USER_ID
-   - TIKTOK_ACCESS_TOKEN
-   - TIKTOK_USER_ID or TIKTOK_ADVERTISER_ID (depends on TikTok API product setup)
+   - TikTok auth, either:
+     - TIKTOK_ACCESS_TOKEN
+     - OR OAuth v2 vars used by tiktok_oauth_and_stats.py:
+       TIKTOK_CLIENT_KEY, TIKTOK_CLIENT_SECRET, TIKTOK_REDIRECT_URI
+       (and optionally TIKTOK_AUTH_CODE for non-interactive runs)
 
 Run once
 python weekly_social_stats.py --max-videos 7 --since-days 7
@@ -48,12 +51,14 @@ import argparse
 import csv
 import json
 import os
+import secrets
 import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -65,7 +70,11 @@ except ImportError:  # pragma: no cover
 
 
 IG_API_BASE = "https://graph.facebook.com/v21.0"
-TT_API_BASE = "https://business-api.tiktok.com/open_api/v1.3"
+TT_AUTH_URL = "https://www.tiktok.com/v2/auth/authorize/"
+TT_TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
+TT_VIDEO_LIST_URL = "https://open.tiktokapis.com/v2/video/list/"
+TT_VIDEO_QUERY_URL = "https://open.tiktokapis.com/v2/video/query/"
+TT_SCOPES = ["video.list", "user.info.basic"]
 
 # Keep endpoint paths and field names centralized to simplify account/app-specific adjustments.
 IG_ENDPOINTS = {
@@ -74,10 +83,26 @@ IG_ENDPOINTS = {
 }
 
 TT_ENDPOINTS = {
-    # TODO: Verify endpoint versions/paths for your exact TikTok product and scopes.
-    "video_list": "/business/video/list/",
-    "video_insights": "/business/video/get/",
+    # TODO: Add optional refresh_token support if you need unattended long-running OAuth maintenance.
+    "auth": TT_AUTH_URL,
+    "token": TT_TOKEN_URL,
+    "video_list": TT_VIDEO_LIST_URL,
+    "video_query": TT_VIDEO_QUERY_URL,
 }
+
+TT_VIDEO_LIST_FIELDS = ["id", "create_time", "title"]
+TT_VIDEO_QUERY_FIELDS = [
+    "id",
+    "create_time",
+    "title",
+    "duration",
+    "view_count",
+    "like_count",
+    "comment_count",
+    "share_count",
+    "share_url",
+]
+FIXED_LOOKBACK_DAYS = 8
 
 
 @dataclass
@@ -108,7 +133,7 @@ class LabelEntry:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Weekly IG + TikTok stats report")
-    parser.add_argument("--since-days", type=int, default=7)
+    parser.add_argument("--since-days", type=int, default=FIXED_LOOKBACK_DAYS)
     parser.add_argument("--max-videos", type=int, default=7)
     parser.add_argument("--outdir", default="./out")
     parser.add_argument("--dry-run", action="store_true")
@@ -208,6 +233,7 @@ def request_with_retry(
     headers: Optional[Dict[str, str]] = None,
     params: Optional[Dict[str, Any]] = None,
     json_body: Optional[Dict[str, Any]] = None,
+    data_body: Optional[Dict[str, Any]] = None,
     timeout: int = 30,
     max_retries: int = 5,
 ) -> requests.Response:
@@ -220,6 +246,7 @@ def request_with_retry(
             headers=headers,
             params=params,
             json=json_body,
+            data=data_body,
             timeout=timeout,
         )
         if response.status_code < 400:
@@ -250,6 +277,101 @@ def request_with_retry(
             wait_seconds = min(60.0, (2 ** (attempt - 1)) + 0.25)
 
         time.sleep(wait_seconds)
+
+
+def build_tiktok_auth_url(client_key: str, redirect_uri: str) -> Tuple[str, str]:
+    state = secrets.token_urlsafe(16)
+    qs = urlencode(
+        {
+            "client_key": client_key,
+            "response_type": "code",
+            "scope": ",".join(TT_SCOPES),
+            "redirect_uri": redirect_uri,
+            "state": state,
+        }
+    )
+    return f"{TT_ENDPOINTS['auth']}?{qs}", state
+
+
+def exchange_tiktok_code_for_token(
+    session: requests.Session,
+    client_key: str,
+    client_secret: str,
+    redirect_uri: str,
+    code: str,
+) -> Dict[str, Any]:
+    resp = request_with_retry(
+        session,
+        "POST",
+        TT_ENDPOINTS["token"],
+        data_body={
+            "client_key": client_key,
+            "client_secret": client_secret,
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": redirect_uri,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=30,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"TikTok token exchange HTTP error ({resp.status_code}): {resp.text[:400]}")
+    data = resp.json() if resp.content else {}
+    access_token = data.get("access_token")
+    if not access_token:
+        raise RuntimeError(f"TikTok token response missing access_token: {json.dumps(data)[:500]}")
+    return data
+
+
+def get_tiktok_access_token(session: requests.Session) -> str:
+    existing = (os.getenv("TIKTOK_ACCESS_TOKEN") or "").strip()
+    if existing:
+        return existing
+
+    client_key = (os.getenv("TIKTOK_CLIENT_KEY") or "").strip()
+    client_secret = (os.getenv("TIKTOK_CLIENT_SECRET") or "").strip()
+    redirect_uri = (os.getenv("TIKTOK_REDIRECT_URI") or "").strip()
+    auth_code = (os.getenv("TIKTOK_AUTH_CODE") or "").strip()
+
+    missing_oauth_env = [name for name, val in [
+        ("TIKTOK_CLIENT_KEY", client_key),
+        ("TIKTOK_CLIENT_SECRET", client_secret),
+        ("TIKTOK_REDIRECT_URI", redirect_uri),
+    ] if not val]
+    if missing_oauth_env:
+        raise RuntimeError(
+            "Missing required TikTok env vars: TIKTOK_ACCESS_TOKEN "
+            "or OAuth vars (" + ", ".join(missing_oauth_env) + ")"
+        )
+
+    expected_state: Optional[str] = None
+    if not auth_code:
+        if not sys.stdin.isatty():
+            raise RuntimeError(
+                "Missing required TikTok env vars: set TIKTOK_ACCESS_TOKEN, or set TIKTOK_AUTH_CODE with "
+                "TIKTOK_CLIENT_KEY/TIKTOK_CLIENT_SECRET/TIKTOK_REDIRECT_URI"
+            )
+        auth_url, expected_state = build_tiktok_auth_url(client_key, redirect_uri)
+        print("\nTikTok OAuth required. Open this URL and approve:", file=sys.stderr)
+        print(auth_url, file=sys.stderr)
+        print("Paste redirected URL (or code): ", end="", file=sys.stderr)
+        user_in = input().strip()
+        auth_code = user_in
+        state = None
+        if "code=" in user_in:
+            q = parse_qs(urlparse(user_in).query)
+            auth_code = (q.get("code") or [""])[0]
+            state = (q.get("state") or [""])[0]
+            if expected_state and state and state != expected_state:
+                raise RuntimeError("TikTok OAuth state mismatch.")
+        if not auth_code:
+            raise RuntimeError("TikTok OAuth code not provided.")
+
+    token_resp = exchange_tiktok_code_for_token(session, client_key, client_secret, redirect_uri, auth_code)
+    token = token_resp.get("access_token")
+    if not token:
+        raise RuntimeError("TikTok token exchange failed: missing access_token")
+    return str(token)
 
 
 def load_fixture(path: Path) -> Optional[Dict[str, Any]]:
@@ -361,53 +483,111 @@ def fetch_tiktok_raw(
     max_videos: int,
     since_dt: datetime,
 ) -> Dict[str, Any]:
-    url = TT_API_BASE + TT_ENDPOINTS["video_list"]
-    headers = {"Access-Token": access_token, "Content-Type": "application/json"}
+    del user_id, advertiser_id  # Not required in TikTok Display API v2 flow used by this script.
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
 
-    # TODO: Confirm exact payload keys for your TikTok app permissions and account type.
-    body: Dict[str, Any] = {
-        "page": 1,
-        "page_size": max(20, max_videos * 3),
-    }
-    if user_id:
-        body["user_id"] = user_id
-    if advertiser_id:
-        body["advertiser_id"] = advertiser_id
+    list_fields = TT_VIDEO_LIST_FIELDS
+    target_video_count = max(max_videos * 3, max_videos)
+    cursor = 0
+    has_more = True
+    listed: List[Dict[str, Any]] = []
+    last_list_payload: Dict[str, Any] = {}
 
-    resp = request_with_retry(session, "POST", url, headers=headers, json_body=body)
-    data = resp.json() if resp.content else {}
-    if resp.status_code >= 400:
-        raise RuntimeError(f"TikTok API HTTP error ({resp.status_code}): {data}")
+    while has_more and len(listed) < target_video_count:
+        remaining = target_video_count - len(listed)
+        page_size = max(1, min(20, remaining))
+        list_resp = request_with_retry(
+            session,
+            "POST",
+            f"{TT_ENDPOINTS['video_list']}?fields={','.join(list_fields)}",
+            headers=headers,
+            json_body={"max_count": page_size, "cursor": cursor},
+        )
+        list_data = list_resp.json() if list_resp.content else {}
+        last_list_payload = list_data
+        if list_resp.status_code >= 400:
+            raise RuntimeError(f"TikTok list API HTTP error ({list_resp.status_code}): {list_data}")
 
-    # Many TikTok APIs encode errors as JSON fields with HTTP 200.
-    code = safe_get(data, ["code", "status_code"])
-    if code not in (None, 0, "0", "OK"):
-        msg = safe_get(data, ["message", "msg", "status_msg"]) or "Unknown API error"
-        raise RuntimeError(f"TikTok API error (code={code}): {msg}")
+        error_obj = list_data.get("error") if isinstance(list_data, dict) else None
+        if isinstance(error_obj, dict):
+            err_code = str(error_obj.get("code", "")).lower()
+            if err_code not in ("", "ok", "0"):
+                raise RuntimeError(f"TikTok list API error ({error_obj.get('code')}): {error_obj.get('message')}")
 
-    rows = safe_get(data, ["data", "result", "list", "videos"]) or {}
-    if isinstance(rows, dict):
-        videos = safe_get(rows, ["list", "videos", "items", "data"]) or []
-    elif isinstance(rows, list):
-        videos = rows
-    else:
-        videos = []
+        page_data = (list_data or {}).get("data") or {}
+        page_videos = page_data.get("videos") or []
+        if not isinstance(page_videos, list):
+            page_videos = []
+        listed.extend(v for v in page_videos if isinstance(v, dict))
 
-    out: List[Dict[str, Any]] = []
-    for item in videos:
-        if not isinstance(item, dict):
+        has_more = bool(page_data.get("has_more"))
+        next_cursor = page_data.get("cursor")
+        if next_cursor is None:
+            break
+        cursor = next_cursor
+
+    recent_listed: List[Dict[str, Any]] = []
+    for row in listed:
+        if not isinstance(row, dict):
             continue
-        dt = parse_datetime(safe_get(item, ["create_time", "created_time", "publish_time", "create_timestamp"]))
+        created = parse_datetime(safe_get(row, ["create_time", "created_time", "publish_time", "create_timestamp"]))
+        if created is None:
+            continue
+        if created < since_dt:
+            continue
+        recent_listed.append(row)
+
+    ids = [str(v.get("id")) for v in recent_listed if isinstance(v, dict) and v.get("id")]
+    if not ids:
+        return {"data": [], "raw": {"list": last_list_payload, "query": {}}}
+
+    queried: List[Dict[str, Any]] = []
+    query_payloads: List[Dict[str, Any]] = []
+    for i in range(0, len(ids), 20):
+        batch_ids = ids[i : i + 20]
+        query_resp = request_with_retry(
+            session,
+            "POST",
+            f"{TT_ENDPOINTS['video_query']}?fields={','.join(TT_VIDEO_QUERY_FIELDS)}",
+            headers=headers,
+            json_body={"filters": {"video_ids": batch_ids}},
+        )
+        query_data = query_resp.json() if query_resp.content else {}
+        query_payloads.append(query_data if isinstance(query_data, dict) else {})
+        if query_resp.status_code >= 400:
+            raise RuntimeError(f"TikTok query API HTTP error ({query_resp.status_code}): {query_data}")
+        query_error = query_data.get("error") if isinstance(query_data, dict) else None
+        if isinstance(query_error, dict):
+            err_code = str(query_error.get("code", "")).lower()
+            if err_code not in ("", "ok", "0"):
+                raise RuntimeError(f"TikTok query API error ({query_error.get('code')}): {query_error.get('message')}")
+        batch_videos = (((query_data or {}).get("data") or {}).get("videos")) or []
+        if isinstance(batch_videos, list):
+            queried.extend(v for v in batch_videos if isinstance(v, dict))
+
+    list_by_id: Dict[str, Dict[str, Any]] = {}
+    for row in recent_listed:
+        if isinstance(row, dict) and row.get("id"):
+            list_by_id[str(row["id"])] = row
+
+    merged_rows: List[Dict[str, Any]] = []
+    for row in queried:
+        if not isinstance(row, dict):
+            continue
+        row_id = str(row.get("id") or "")
+        merged = dict(list_by_id.get(row_id, {}))
+        merged.update(row)
+        dt = parse_datetime(safe_get(merged, ["create_time", "created_time", "publish_time", "create_timestamp"]))
         if dt and dt < since_dt:
             continue
-        out.append(item)
+        merged_rows.append(merged)
 
-    out.sort(
+    merged_rows.sort(
         key=lambda m: parse_datetime(safe_get(m, ["create_time", "created_time", "publish_time", "create_timestamp"]))
         or datetime.min.replace(tzinfo=timezone.utc),
         reverse=True,
     )
-    return {"data": out[:max_videos], "raw": data}
+    return {"data": merged_rows[:max_videos], "raw": {"list": last_list_payload, "query": query_payloads}}
 
 
 def normalize_instagram(raw: Dict[str, Any]) -> List[NormalizedVideo]:
@@ -508,9 +688,9 @@ def normalize_tiktok(raw: Dict[str, Any]) -> List[NormalizedVideo]:
         if percent_full is None:
             percent_full = approximate_percent(avg_watch, duration)
 
-        fyp_pct = coerce_float(safe_get(stats, ["fyp_pct", "for_you_pct", "fyp_traffic_pct"]))
+        fyp_pct = coerce_float(safe_get(stats, ["fyp_pct", "for_you_pct", "for_you_percentage", "fyp_traffic_pct"]))
         if fyp_pct is None:
-            fyp_pct = coerce_float(safe_get(item, ["fyp_pct", "for_you_pct", "fyp_traffic_pct"]))
+            fyp_pct = coerce_float(safe_get(item, ["fyp_pct", "for_you_pct", "for_you_percentage", "fyp_traffic_pct"]))
 
         likes = coerce_int(safe_get(stats, ["like_count", "likes"]))
         if likes is None:
@@ -753,7 +933,12 @@ def main() -> int:
     fixtures_dir = Path("./fixtures")
 
     now_utc = datetime.now(timezone.utc)
-    since_dt = now_utc - timedelta(days=args.since_days)
+    if args.since_days != FIXED_LOOKBACK_DAYS:
+        print(
+            f"Note: --since-days is fixed to {FIXED_LOOKBACK_DAYS} for this job; ignoring value {args.since_days}.",
+            file=sys.stderr,
+        )
+    since_dt = now_utc - timedelta(days=FIXED_LOOKBACK_DAYS)
 
     labels = load_labels(args.max_videos)
 
@@ -780,8 +965,7 @@ def main() -> int:
     else:
         ig_token = os.getenv("IG_ACCESS_TOKEN")
         ig_user_id = os.getenv("IG_USER_ID")
-
-        tt_token = os.getenv("TIKTOK_ACCESS_TOKEN")
+        tt_token: Optional[str] = None
         tt_user_id = os.getenv("TIKTOK_USER_ID")
         tt_advertiser_id = os.getenv("TIKTOK_ADVERTISER_ID")
 
@@ -793,13 +977,10 @@ def main() -> int:
                 missing.append("IG_USER_ID")
             ig_error = f"Missing required Instagram env vars: {', '.join(missing)}"
 
-        if (not tt_token) or (not tt_user_id and not tt_advertiser_id):
-            missing = []
-            if not tt_token:
-                missing.append("TIKTOK_ACCESS_TOKEN")
-            if not tt_user_id and not tt_advertiser_id:
-                missing.append("TIKTOK_USER_ID or TIKTOK_ADVERTISER_ID")
-            tt_error = f"Missing required TikTok env vars: {', '.join(missing)}"
+        try:
+            tt_token = get_tiktok_access_token(session)
+        except Exception as exc:
+            tt_error = str(exc)
 
         if ig_error is None:
             try:
